@@ -13,6 +13,26 @@ from typing import Any, Dict, Optional, Tuple
 
 
 # -----------------------------
+# Constants
+# -----------------------------
+
+# Queue configuration
+DEFAULT_IN_QUEUE_SIZE = 5000      # RX events waiting for processing
+DEFAULT_TX_QUEUE_SIZE = 5000      # Outbound datagrams waiting to send
+
+# Socket configuration
+DEFAULT_RECV_BUF_BYTES = 4 * 1024 * 1024  # 4MB receive buffer
+DEFAULT_MAX_DATAGRAM_BYTES = 65507        # Max UDP datagram size
+
+# Thread configuration
+SOCKET_TIMEOUT_SECONDS = 0.5      # Socket timeout for checking stop_event
+THREAD_JOIN_TIMEOUT_SECONDS = 2.0 # Time to wait for threads to exit on shutdown
+
+# Health reporting
+HEALTH_REPORT_INTERVAL_SECONDS = 30  # How often to log health metrics
+
+
+# -----------------------------
 # Types
 # -----------------------------
 
@@ -130,8 +150,8 @@ class UdpReceiver(threading.Thread):
         stop_event: threading.Event,
         counters: Counters,
         logger: logging.Logger,
-        recv_buf_bytes: int = 4 * 1024 * 1024,
-        max_datagram_bytes: int = 65507,
+        recv_buf_bytes: int = DEFAULT_RECV_BUF_BYTES,
+        max_datagram_bytes: int = DEFAULT_MAX_DATAGRAM_BYTES,
     ) -> None:
         super().__init__(name="UdpReceiver", daemon=True)
         self.sock = sock
@@ -145,11 +165,11 @@ class UdpReceiver(threading.Thread):
         # Help with bursts (best effort; OS may adjust)
         try:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, recv_buf_bytes)
-        except OSError:
-            pass
+        except OSError as e:
+            self.log.error("Failed to set SO_RCVBUF to %d bytes: %s", recv_buf_bytes, e)
 
         # Timeout so we can check stop_event regularly
-        self.sock.settimeout(0.5)
+        self.sock.settimeout(SOCKET_TIMEOUT_SECONDS)
 
     def run(self) -> None:
         self.log.info("UDP RX started on port %d", self.local_port)
@@ -172,6 +192,10 @@ class UdpReceiver(threading.Thread):
                     self.out_queue.put_nowait(evt)
                 except queue.Full:
                     self.counters.inc("rx_dropped_queue_full", 1)
+                    self.log.warning(
+                        "RX queue full, dropped packet from=%s:%d local_port=%d size=%d",
+                        addr[0], addr[1], self.local_port, len(data)
+                    )
 
             except socket.timeout:
                 continue
@@ -209,7 +233,7 @@ class UdpSender(threading.Thread):
         self.counters = counters
         self.log = logger
 
-        self.sock.settimeout(0.5)
+        self.sock.settimeout(SOCKET_TIMEOUT_SECONDS)
 
     def run(self) -> None:
         self.log.info("UDP TX started on port %d", self.local_port)
@@ -283,6 +307,8 @@ class Processor(threading.Thread):
             except Exception as e:
                 self.counters.inc("rx_parse_fail", 1)
                 # Truncate payload in logs
+                # TODO: Sanitize payload snippet to prevent log injection attacks
+                # (newlines, control chars, etc. could mess with log parsing)
                 snippet = evt.data[:200]
                 self.log.warning(
                     "Parse fail local_port=%d from=%s:%d err=%s payload_snip=%r",
@@ -291,6 +317,8 @@ class Processor(threading.Thread):
                 continue
 
             # Extract or synthesize a message id (good for dedupe/log correlation)
+            # TODO: Implement message deduplication using msg_id
+            # UDP can deliver duplicates; consider time-windowed dedup cache
             msg_id = None
             if isinstance(obj, dict):
                 msg_id = obj.get("msg_id") or obj.get("id")
@@ -300,6 +328,8 @@ class Processor(threading.Thread):
             # 1) validate fields
             # 2) decide if you send an outbound UDP message
             # 3) or forward to "other process" (TBD) via another queue/adapter
+            # TODO: Currently assumes single fixed TX destination (self.tx_dest)
+            # If routing to multiple destinations is needed, implement routing logic here
 
             # Example: echo-ish ack or normalized envelope to TX
             envelope: Dict[str, Any] = {
@@ -342,7 +372,7 @@ class HealthReporter(threading.Thread):
         counters: Counters,
         stop_event: threading.Event,
         logger: logging.Logger,
-        interval_s: int = 30,
+        interval_s: int = HEALTH_REPORT_INTERVAL_SECONDS,
     ) -> None:
         super().__init__(name="HealthReporter", daemon=True)
         self.counters = counters
@@ -362,9 +392,6 @@ class HealthReporter(threading.Thread):
 # -----------------------------
 
 def validate_ports(rx_port: int, tx_port: int) -> None:
-    ports = {rx_port, tx_port}
-    if ports != {10000, 10001}:
-        raise ValueError(f"Expected ports {{10000,10001}} in some order; got rx={rx_port} tx={tx_port}")
     if rx_port == tx_port:
         raise ValueError("RX and TX ports must differ")
 
@@ -385,8 +412,8 @@ def main() -> int:
     ap.add_argument("--log-dir", default=os.path.join(os.getcwd(), "logs"))
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     ap.add_argument("--eventlog", action="store_true", help="Enable Windows Event Log (WARNING+)")
-    ap.add_argument("--in-queue-size", type=int, default=5000)
-    ap.add_argument("--tx-queue-size", type=int, default=5000)
+    ap.add_argument("--in-queue-size", type=int, default=DEFAULT_IN_QUEUE_SIZE)
+    ap.add_argument("--tx-queue-size", type=int, default=DEFAULT_TX_QUEUE_SIZE)
     args = ap.parse_args()
 
     validate_ports(args.rx_port, args.tx_port)
@@ -449,7 +476,7 @@ def main() -> int:
         counters=counters,
         stop_event=stop_event,
         logger=logging.getLogger("health"),
-        interval_s=30,
+        interval_s=HEALTH_REPORT_INTERVAL_SECONDS,
     )
 
     rx.start()
@@ -457,6 +484,9 @@ def main() -> int:
     proc.start()
     health.start()
 
+    # TODO: Add thread health monitoring - detect and restart dead threads
+    # Currently if any worker thread dies unexpectedly, it won't be restarted
+    # Consider: periodic aliveness checks, automatic restart, alerting
     try:
         while True:
             time.sleep(1.0)
@@ -474,10 +504,11 @@ def main() -> int:
             pass
 
         # Give threads a moment to exit
-        rx.join(timeout=2.0)
-        proc.join(timeout=2.0)
-        tx.join(timeout=2.0)
-        health.join(timeout=2.0)
+        # Note: timeout may need adjustment if queues are large
+        rx.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
+        proc.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
+        tx.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
+        health.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
 
         log.info("Stopped. Final counters=%s", counters.snapshot())
         listener.stop()
