@@ -26,6 +26,7 @@ DEFAULT_MAX_DATAGRAM_BYTES = 65507        # Max UDP datagram size
 
 # Thread configuration
 SOCKET_TIMEOUT_SECONDS = 0.5      # Socket timeout for checking stop_event
+QUEUE_GET_TIMEOUT_SECONDS = 0.5   # Queue get timeout for checking stop_event
 THREAD_JOIN_TIMEOUT_SECONDS = 2.0 # Time to wait for threads to exit on shutdown
 
 # Health reporting
@@ -193,8 +194,8 @@ class UdpReceiver(threading.Thread):
                 except queue.Full:
                     self.counters.inc("rx_dropped_queue_full", 1)
                     self.log.warning(
-                        "RX queue full, dropped packet from=%s:%d local_port=%d size=%d",
-                        addr[0], addr[1], self.local_port, len(data)
+                        "RX queue full, dropped packet from=%s:%d size=%d",
+                        addr[0], addr[1], len(data)
                     )
 
             except socket.timeout:
@@ -240,7 +241,7 @@ class UdpSender(threading.Thread):
 
         while not self.stop_event.is_set():
             try:
-                pkt = self.in_queue.get(timeout=0.5)
+                pkt = self.in_queue.get(timeout=QUEUE_GET_TIMEOUT_SECONDS)
             except queue.Empty:
                 continue
 
@@ -295,7 +296,7 @@ class Processor(threading.Thread):
 
         while not self.stop_event.is_set():
             try:
-                evt = self.in_queue.get(timeout=0.5)
+                evt = self.in_queue.get(timeout=QUEUE_GET_TIMEOUT_SECONDS)
             except queue.Empty:
                 continue
 
